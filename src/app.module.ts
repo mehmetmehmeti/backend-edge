@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { AuthModule } from './auth/auth.module';
+import { CommandExecutorModule } from './command-executor/command-executor.module';
 import { CommandsModule } from './commands/commands.module';
 import { DevicesModule } from './devices/devices.module';
 import { PrismaModule } from './prisma/prisma.module';
@@ -20,7 +21,7 @@ import { VideosModule } from './videos/videos.module';
     VideosModule,
     CommandsModule,
     SyncModule,
+    CommandExecutorModule,
   ],
 })
 export class AppModule {}
-
