@@ -40,6 +40,9 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
   private readonly executorId = process.env.EDGE_DEVICE_ID?.trim() || 'edge-dev-001';
   private readonly pollIntervalMs = Number(process.env.EDGE_COMMAND_POLL_INTERVAL_MS ?? 1000);
   private readonly recordingsDir = process.env.EDGE_RECORDINGS_DIR?.trim() || 'recordings';
+  private readonly streamEdgeBaseUrl = (
+    process.env.STREAM_EDGE_CONTROL_BASE_URL?.trim() || 'http://127.0.0.1:8081'
+  ).replace(/\/+$/, '');
   private timer?: NodeJS.Timeout;
   private isProcessing = false;
 
@@ -183,7 +186,7 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
     }
 
     const now = new Date();
-    await this.runOptionalHook('EDGE_START_STREAM_COMMAND', command);
+    await this.runStreamControlHook('EDGE_START_STREAM_COMMAND', '/stream/start', command);
 
     await this.prisma.$transaction(async (tx) => {
       const device = await tx.device.update({
@@ -231,7 +234,7 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
     }
 
     const now = new Date();
-    await this.runOptionalHook('EDGE_STOP_STREAM_COMMAND', command);
+    await this.runStreamControlHook('EDGE_STOP_STREAM_COMMAND', '/stream/stop', command);
 
     await this.prisma.$transaction(async (tx) => {
       const activeRecordings = await tx.video.count({
@@ -284,7 +287,12 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
     const videoId = command.videoId;
 
     const now = new Date();
-    await this.runOptionalHook('EDGE_START_RECORDING_COMMAND', command);
+    const hookResponse = await this.runStreamControlHook(
+      'EDGE_START_RECORDING_COMMAND',
+      '/record/start',
+      command,
+    );
+    const recordingPath = this.recordingPathFromHookResponse(hookResponse) ?? this.localRecordingPath(videoId);
 
     await this.prisma.$transaction(async (tx) => {
       const device = await tx.device.update({
@@ -301,7 +309,7 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
         where: { id: videoId },
         data: {
           status: VideoStatus.RECORDING,
-          edgeLocalPath: this.localRecordingPath(videoId),
+          edgeLocalPath: recordingPath,
           startedAt: command.video?.startedAt ?? now,
           version: { increment: 1 },
           updatedAt: now,
@@ -329,14 +337,22 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
     const videoId = command.videoId;
 
     const now = new Date();
-    await this.runOptionalHook('EDGE_STOP_RECORDING_COMMAND', command);
+    const hookResponse = await this.runStreamControlHook(
+      'EDGE_STOP_RECORDING_COMMAND',
+      '/record/stop',
+      command,
+    );
+    const recordingPath =
+      this.recordingPathFromHookResponse(hookResponse) ??
+      command.video?.edgeLocalPath ??
+      this.localRecordingPath(videoId);
 
     await this.prisma.$transaction(async (tx) => {
       const video = await tx.video.update({
         where: { id: videoId },
         data: {
           status: VideoStatus.UPLOADING,
-          edgeLocalPath: command.video?.edgeLocalPath ?? this.localRecordingPath(videoId),
+          edgeLocalPath: recordingPath,
           endedAt: now,
           durationSeconds: this.durationSeconds(command.video?.startedAt, now),
           version: { increment: 1 },
@@ -508,28 +524,39 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
     );
   }
 
-  private async runOptionalHook(envName: string, command: ClaimedCommand) {
-    const url = process.env[`${envName}_URL`]?.trim();
-    if (!url) {
-      return;
-    }
+  private async runStreamControlHook(
+    envName: string,
+    defaultPath: string,
+    command: ClaimedCommand,
+  ): Promise<unknown> {
+    const url = process.env[`${envName}_URL`]?.trim() || `${this.streamEdgeBaseUrl}${defaultPath}`;
+    const caseId = command.videoId ?? command.streamId ?? command.id;
 
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         command_id: command.id,
+        case_id: caseId,
         command: command.command.toLowerCase(),
         target: command.target.toLowerCase(),
         device_id: command.deviceId,
         stream_id: command.streamId,
         video_id: command.videoId,
+        metadata_managed_by_client: true,
       }),
     });
 
     if (!response.ok) {
       throw new Error(`${envName}_URL failed with status ${response.status}`);
     }
+
+    const contentType = response.headers.get('content-type') ?? '';
+    if (!contentType.includes('application/json')) {
+      return undefined;
+    }
+
+    return response.json();
   }
 
   private viewerUrl(streamId: string) {
@@ -544,6 +571,22 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
 
   private localRecordingPath(videoId: string) {
     return `${this.recordingsDir.replace(/\/+$/, '')}/${videoId}.mp4`;
+  }
+
+  private recordingPathFromHookResponse(value: unknown) {
+    if (!value || typeof value !== 'object') {
+      return undefined;
+    }
+
+    const payload = value as {
+      recordingStatus?: {
+        output_path?: unknown;
+        local_path?: unknown;
+      };
+    };
+
+    const outputPath = payload.recordingStatus?.output_path ?? payload.recordingStatus?.local_path;
+    return typeof outputPath === 'string' && outputPath.trim() ? outputPath : undefined;
   }
 
   private durationSeconds(startedAt: Date | null | undefined, endedAt: Date) {
