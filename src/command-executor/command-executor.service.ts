@@ -34,11 +34,21 @@ type CommandEntityUpdate =
   | { entityType: 'stream'; entityId: string; version: number; data: ReturnType<typeof streamDto> }
   | { entityType: 'video'; entityId: string; version: number; data: ReturnType<typeof videoDto> };
 
+type StreamEdgeStatusPayload = {
+  status?: unknown;
+  streaming?: unknown;
+  sourceSignalError?: unknown;
+  lastError?: unknown;
+  message?: unknown;
+};
+
 @Injectable()
 export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(CommandExecutorService.name);
   private readonly executorId = process.env.EDGE_DEVICE_ID?.trim() || 'edge-dev-001';
   private readonly pollIntervalMs = Number(process.env.EDGE_COMMAND_POLL_INTERVAL_MS ?? 1000);
+  private readonly startVerifyAttempts = Number(process.env.STREAM_EDGE_START_VERIFY_ATTEMPTS ?? 5);
+  private readonly startVerifyDelayMs = Number(process.env.STREAM_EDGE_START_VERIFY_DELAY_MS ?? 250);
   private readonly recordingsDir = process.env.EDGE_RECORDINGS_DIR?.trim() || 'recordings';
   private readonly streamEdgeBaseUrl = (
     process.env.STREAM_EDGE_CONTROL_BASE_URL?.trim() || 'http://127.0.0.1:8081'
@@ -187,6 +197,7 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
 
     const now = new Date();
     await this.runStreamControlHook('EDGE_START_STREAM_COMMAND', '/stream/start', command);
+    await this.verifyStreamEdgeStarted();
 
     await this.prisma.$transaction(async (tx) => {
       const device = await tx.device.update({
@@ -401,6 +412,14 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
         where: { id: command.deviceId },
         data: {
           status: DeviceStatusValue.ERROR,
+          streaming:
+            command.target === CommandTarget.STREAM && command.command === CommandName.START
+              ? false
+              : undefined,
+          recording:
+            command.target === CommandTarget.RECORDING && command.command === CommandName.START
+              ? false
+              : undefined,
           lastError: message,
           lastSeenAt: now,
           version: { increment: 1 },
@@ -548,7 +567,10 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
     });
 
     if (!response.ok) {
-      throw new Error(`${envName}_URL failed with status ${response.status}`);
+      const body = await response.text();
+      throw new Error(
+        `${envName}_URL failed with status ${response.status}${body ? `: ${body}` : ''}`,
+      );
     }
 
     const contentType = response.headers.get('content-type') ?? '';
@@ -557,6 +579,65 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
     }
 
     return response.json();
+  }
+
+  private async verifyStreamEdgeStarted() {
+    const attempts = Math.max(1, this.startVerifyAttempts);
+    const delayMs = Math.max(0, this.startVerifyDelayMs);
+    let lastStatus: StreamEdgeStatusPayload | undefined;
+
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      if (attempt > 1 && delayMs > 0) {
+        await this.delay(delayMs);
+      }
+
+      lastStatus = await this.fetchStreamEdgeStatus();
+      if (lastStatus.streaming === true && lastStatus.status !== 'error') {
+        return;
+      }
+
+      if (lastStatus.status === 'error') {
+        throw new Error(this.streamEdgeStatusMessage(lastStatus));
+      }
+    }
+
+    throw new Error(this.streamEdgeStatusMessage(lastStatus));
+  }
+
+  private async fetchStreamEdgeStatus(): Promise<StreamEdgeStatusPayload> {
+    const response = await fetch(`${this.streamEdgeBaseUrl}/stream/status`);
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(
+        `STREAM_EDGE_CONTROL_BASE_URL status check failed with status ${response.status}${
+          body ? `: ${body}` : ''
+        }`,
+      );
+    }
+
+    const payload = await response.json();
+    return payload && typeof payload === 'object' ? (payload as StreamEdgeStatusPayload) : {};
+  }
+
+  private streamEdgeStatusMessage(status?: StreamEdgeStatusPayload) {
+    const detail =
+      this.optionalStatusString(status?.lastError) ??
+      this.optionalStatusString(status?.sourceSignalError) ??
+      this.optionalStatusString(status?.message);
+
+    if (detail) {
+      return `Stream edge did not enter streaming state: ${detail}`;
+    }
+
+    return 'Stream edge did not enter streaming state';
+  }
+
+  private optionalStatusString(value: unknown) {
+    return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+  }
+
+  private delay(ms: number) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   private viewerUrl(streamId: string) {
