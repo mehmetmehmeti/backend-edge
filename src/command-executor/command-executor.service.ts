@@ -47,8 +47,8 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(CommandExecutorService.name);
   private readonly executorId = process.env.EDGE_DEVICE_ID?.trim() || 'edge-dev-001';
   private readonly pollIntervalMs = Number(process.env.EDGE_COMMAND_POLL_INTERVAL_MS ?? 1000);
-  private readonly startVerifyAttempts = Number(process.env.STREAM_EDGE_START_VERIFY_ATTEMPTS ?? 5);
-  private readonly startVerifyDelayMs = Number(process.env.STREAM_EDGE_START_VERIFY_DELAY_MS ?? 250);
+  private readonly startVerifyAttempts = Number(process.env.STREAM_EDGE_START_VERIFY_ATTEMPTS ?? 20);
+  private readonly startVerifyDelayMs = Number(process.env.STREAM_EDGE_START_VERIFY_DELAY_MS ?? 500);
   private readonly recordingsDir = process.env.EDGE_RECORDINGS_DIR?.trim() || 'recordings';
   private readonly streamEdgeBaseUrl = (
     process.env.STREAM_EDGE_CONTROL_BASE_URL?.trim() || 'http://127.0.0.1:8081'
