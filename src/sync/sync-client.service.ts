@@ -8,6 +8,7 @@ export class SyncClientService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(SyncClientService.name);
   private socket?: WebSocket;
   private reconnectTimer?: NodeJS.Timeout;
+  private flushTimer?: NodeJS.Timeout;
   private stopped = false;
 
   constructor(
@@ -20,12 +21,18 @@ export class SyncClientService implements OnModuleInit, OnModuleDestroy {
     this.syncOutbox.on(OUTBOX_EVENT_CREATED, () => {
       void this.sendPendingEvents();
     });
+    this.flushTimer = setInterval(() => {
+      void this.sendPendingEvents();
+    }, 2000);
   }
 
   onModuleDestroy() {
     this.stopped = true;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
+    }
+    if (this.flushTimer) {
+      clearInterval(this.flushTimer);
     }
     this.socket?.close();
   }
