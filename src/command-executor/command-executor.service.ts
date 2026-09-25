@@ -46,6 +46,8 @@ type StreamEdgeStatusPayload = {
     state?: unknown;
     message?: unknown;
     lastError?: unknown;
+    stream_name?: unknown;
+    session_id?: unknown;
   };
 };
 
@@ -204,7 +206,7 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
 
     const now = new Date();
     await this.runStreamControlHook('EDGE_START_STREAM_COMMAND', '/stream/start', command);
-    await this.verifyStreamEdgeStarted();
+    await this.verifyStreamEdgeStarted(command.streamId);
 
     await this.prisma.$transaction(async (tx) => {
       const device = await tx.device.update({
@@ -588,7 +590,7 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
     return response.json();
   }
 
-  private async verifyStreamEdgeStarted() {
+  private async verifyStreamEdgeStarted(expectedStreamId: string) {
     const attempts = Math.max(1, this.startVerifyAttempts);
     const delayMs = Math.max(0, this.startVerifyDelayMs);
     let lastStatus: StreamEdgeStatusPayload | undefined;
@@ -599,7 +601,7 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
       }
 
       lastStatus = await this.fetchStreamEdgeStatus();
-      if (this.streamEdgeIsLive(lastStatus)) {
+      if (this.streamEdgeIsLive(lastStatus, expectedStreamId)) {
         return;
       }
 
@@ -641,7 +643,7 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
     return 'Stream edge did not enter streaming state';
   }
 
-  private streamEdgeIsLive(status: StreamEdgeStatusPayload) {
+  private streamEdgeIsLive(status: StreamEdgeStatusPayload, expectedStreamId: string) {
     if (status.streaming !== true || status.status === 'error') {
       return false;
     }
@@ -660,6 +662,13 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
     }
 
     if (publisher.enabled === true && publisher.running !== true) {
+      return false;
+    }
+
+    const publishedStream =
+      this.optionalStatusString(publisher.stream_name) ??
+      this.optionalStatusString(publisher.session_id);
+    if (publishedStream && publishedStream !== expectedStreamId) {
       return false;
     }
 
