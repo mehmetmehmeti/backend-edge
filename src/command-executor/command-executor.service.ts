@@ -40,6 +40,13 @@ type StreamEdgeStatusPayload = {
   sourceSignalError?: unknown;
   lastError?: unknown;
   message?: unknown;
+  publisher?: {
+    enabled?: unknown;
+    running?: unknown;
+    state?: unknown;
+    message?: unknown;
+    lastError?: unknown;
+  };
 };
 
 @Injectable()
@@ -592,7 +599,7 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
       }
 
       lastStatus = await this.fetchStreamEdgeStatus();
-      if (lastStatus.streaming === true && lastStatus.status !== 'error') {
+      if (this.streamEdgeIsLive(lastStatus)) {
         return;
       }
 
@@ -623,6 +630,8 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
     const detail =
       this.optionalStatusString(status?.lastError) ??
       this.optionalStatusString(status?.sourceSignalError) ??
+      this.optionalStatusString(status?.publisher?.lastError) ??
+      this.optionalStatusString(status?.publisher?.message) ??
       this.optionalStatusString(status?.message);
 
     if (detail) {
@@ -630,6 +639,31 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
     }
 
     return 'Stream edge did not enter streaming state';
+  }
+
+  private streamEdgeIsLive(status: StreamEdgeStatusPayload) {
+    if (status.streaming !== true || status.status === 'error') {
+      return false;
+    }
+
+    const publisher = status.publisher;
+    if (!publisher || typeof publisher !== 'object') {
+      return true;
+    }
+
+    if (publisher.enabled === false) {
+      return false;
+    }
+
+    if (publisher.state === 'failed') {
+      return false;
+    }
+
+    if (publisher.enabled === true && publisher.running !== true) {
+      return false;
+    }
+
+    return true;
   }
 
   private optionalStatusString(value: unknown) {
