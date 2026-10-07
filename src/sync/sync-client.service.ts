@@ -10,6 +10,7 @@ export class SyncClientService implements OnModuleInit, OnModuleDestroy {
   private reconnectTimer?: NodeJS.Timeout;
   private flushTimer?: NodeJS.Timeout;
   private stopped = false;
+  private sending = false;
 
   constructor(
     private readonly syncService: SyncService,
@@ -103,6 +104,9 @@ export class SyncClientService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async sendPendingEvents() {
+    if (this.sending) return;
+    this.sending = true;
+    try {
     if (this.socket?.readyState !== WebSocket.OPEN) {
       return;
     }
@@ -110,6 +114,11 @@ export class SyncClientService implements OnModuleInit, OnModuleDestroy {
     for (const event of events) {
       this.sendJson(event);
       await this.syncOutbox.markSent(event.event_id);
+    }
+    } catch (error) {
+      this.logger.warn(error instanceof Error ? error.message : 'Sync send failed');
+    } finally {
+      this.sending = false;
     }
   }
 

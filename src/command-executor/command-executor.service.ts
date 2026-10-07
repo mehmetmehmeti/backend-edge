@@ -38,6 +38,8 @@ type StreamEdgeStatusPayload = {
   status?: unknown;
   streaming?: unknown;
   sourceSignalError?: unknown;
+  sourceSignal?: unknown;
+  recording?: unknown;
   lastError?: unknown;
   message?: unknown;
   publisher?: {
@@ -48,6 +50,7 @@ type StreamEdgeStatusPayload = {
     lastError?: unknown;
     stream_name?: unknown;
     session_id?: unknown;
+    frames_progressing?: unknown;
   };
 };
 
@@ -64,14 +67,21 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
   ).replace(/\/+$/, '');
   private timer?: NodeJS.Timeout;
   private isProcessing = false;
+  private lastReconciledAt = 0;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly syncOutbox: SyncOutboxService,
   ) {}
 
-  onModuleInit() {
+  async onModuleInit() {
     this.logger.log(`Starting command executor for device ${this.executorId}`);
+    const interrupted = await this.prisma.command.findMany({
+      where: { deviceId: this.executorId, status: { in: [CommandStatus.CLAIMED, CommandStatus.PROCESSING] } },
+      include: { stream: true, video: true, device: true },
+    });
+    for (const command of interrupted)
+      await this.failCommand(command, new Error('Edge executor restarted before command completion; check device state'));
     this.timer = setInterval(() => {
       void this.processPendingCommands();
     }, Math.max(250, this.pollIntervalMs));
@@ -95,10 +105,16 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
       while (true) {
         const command = await this.claimNextCommand();
         if (!command) {
+          if (Date.now() - this.lastReconciledAt > 5000) {
+            this.lastReconciledAt = Date.now();
+            await this.reconcileDevice();
+          }
           return;
         }
         await this.executeCommand(command);
       }
+    } catch (error) {
+      this.logger.error(error instanceof Error ? error.message : 'Command poll failed');
     } finally {
       this.isProcessing = false;
     }
@@ -110,7 +126,7 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
         deviceId: this.executorId,
         status: CommandStatus.PENDING,
       },
-      orderBy: { createdAt: 'asc' },
+      orderBy: { queuePosition: 'asc' },
     });
 
     if (!pending) {
@@ -156,6 +172,32 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
     });
 
     return claimed;
+  }
+
+  private async reconcileDevice() {
+    let status: StreamEdgeStatusPayload | undefined;
+    try { status = await this.fetchStreamEdgeStatus(); } catch { /* Report unavailable service below. */ }
+    const now = new Date();
+    const live = status?.streaming === true && status.publisher?.state === 'running' && status.publisher.frames_progressing === true;
+    const error = !status ? 'Camera service unavailable' : status.status === 'error' ? this.streamEdgeStatusMessage(status) : null;
+    await this.prisma.$transaction(async tx => {
+      const data = { status: !status ? DeviceStatusValue.OFFLINE : error ? DeviceStatusValue.ERROR : live ? DeviceStatusValue.STREAMING : DeviceStatusValue.ONLINE,
+        streaming: live, recording: status?.recording === true, sourceReady: status?.sourceSignal === true,
+        lastError: error, lastSeenAt: now, updatedAt: now };
+      const device = await tx.device.upsert({ where: { id: this.executorId },
+        create: { id: this.executorId, name: this.executorId, ...data },
+        update: { ...data, version: { increment: 1 } } });
+      await this.emitSyncEvent(tx, 'device', device.id, device.version, deviceDto(device), now);
+      const staleStreams = await tx.stream.findMany({ where: { deviceId: this.executorId, status: StreamStatus.LIVE } });
+      for (const stream of staleStreams) {
+        if (live && status?.publisher?.stream_name === stream.id) continue;
+        const updated = await tx.stream.update({ where: { id: stream.id }, data: {
+          status: error ? StreamStatus.ERROR : StreamStatus.ENDED, endedAt: now,
+          lastError: error, version: { increment: 1 }, updatedAt: now,
+        } });
+        await this.emitSyncEvent(tx, 'stream', updated.id, updated.version, streamDto(updated), now);
+      }
+    });
   }
 
   private async executeCommand(command: ClaimedCommand) {
@@ -205,6 +247,9 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
     }
 
     const now = new Date();
+    const previous = await this.fetchStreamEdgeStatus();
+    if (previous.streaming && previous.publisher?.stream_name !== command.streamId)
+      throw new Error('Another stream already owns the camera; stop it before starting a new stream');
     await this.runStreamControlHook('EDGE_START_STREAM_COMMAND', '/stream/start', command);
     await this.verifyStreamEdgeStarted(command.streamId);
 
@@ -254,6 +299,9 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
     }
 
     const now = new Date();
+    const current = await this.fetchStreamEdgeStatus();
+    if (current.streaming && current.publisher?.stream_name !== command.streamId)
+      throw new Error('Stop command targets a different stream than the active camera');
     await this.runStreamControlHook('EDGE_STOP_STREAM_COMMAND', '/stream/stop', command);
 
     await this.prisma.$transaction(async (tx) => {
@@ -362,6 +410,12 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
       '/record/stop',
       command,
     );
+    const diagnostics = (hookResponse as { recordingStatus?: {
+      finalized?: boolean; written_frames?: number; dropped_frames?: number; last_error?: string;
+    } })?.recordingStatus;
+    if (!diagnostics?.finalized || !diagnostics.written_frames)
+      throw new Error(diagnostics?.last_error || 'Recording did not finalize with valid frames');
+    const writtenFrames = BigInt(diagnostics.written_frames);
     const recordingPath =
       this.recordingPathFromHookResponse(hookResponse) ??
       command.video?.edgeLocalPath ??
@@ -372,6 +426,8 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
         where: { id: videoId },
         data: {
           status: VideoStatus.UPLOADING,
+          frameCount: writtenFrames,
+          droppedFrames: BigInt(diagnostics.dropped_frames || 0),
           edgeLocalPath: recordingPath,
           endedAt: now,
           durationSeconds: this.durationSeconds(command.video?.startedAt, now),
@@ -562,6 +618,7 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
 
     const response = await fetch(url, {
       method: 'POST',
+      signal: AbortSignal.timeout(20000),
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         command_id: command.id,
@@ -602,10 +659,13 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
 
       lastStatus = await this.fetchStreamEdgeStatus();
       if (this.streamEdgeIsLive(lastStatus, expectedStreamId)) {
-        return;
+        const media = await fetch(`${process.env.MEDIA_SERVER_API_URL || 'http://127.0.0.1:3010'}/api/health`, {
+          signal: AbortSignal.timeout(3000),
+        }).then(response => response.json()).catch(() => null) as { streams?: { streamId: string }[] } | null;
+        if (media?.streams?.some(stream => stream.streamId === expectedStreamId)) return;
       }
 
-      if (lastStatus.status === 'error') {
+      if (lastStatus.publisher?.state === 'failed' || lastStatus.lastError) {
         throw new Error(this.streamEdgeStatusMessage(lastStatus));
       }
     }
@@ -614,7 +674,7 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async fetchStreamEdgeStatus(): Promise<StreamEdgeStatusPayload> {
-    const response = await fetch(`${this.streamEdgeBaseUrl}/stream/status`);
+    const response = await fetch(`${this.streamEdgeBaseUrl}/stream/status`, { signal: AbortSignal.timeout(3000) });
     if (!response.ok) {
       const body = await response.text();
       throw new Error(
@@ -662,6 +722,9 @@ export class CommandExecutorService implements OnModuleInit, OnModuleDestroy {
     }
 
     if (publisher.enabled === true && publisher.running !== true) {
+      return false;
+    }
+    if (publisher.state !== 'running' || publisher.frames_progressing !== true) {
       return false;
     }
 

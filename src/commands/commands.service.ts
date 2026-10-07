@@ -53,7 +53,7 @@ export class CommandsService {
       videoId: optionalString(body.video_id ?? body.videoId),
       command: commandName(body.command),
       target: commandTarget(body.target),
-      source: optionalString(body.source) ?? 'cloud',
+      source: 'edge',
     });
     return { command: commandDto(command) };
   }
@@ -70,7 +70,7 @@ export class CommandsService {
         command: input.command,
         target: input.target,
         status: CommandStatus.PENDING,
-        source: input.source ?? 'cloud',
+        source: input.source ?? 'edge',
         createdAt: now,
         updatedAt: now,
       },
